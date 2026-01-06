@@ -1,0 +1,11 @@
+# Matter2MQTT Configuration Example
+# Copy this file to matter2mqtt.yaml and update with your actual settings
+
+mqtt:
+  # The MQTT broker settings (mosquitto)
+  host: localhost
+  port: 1883
+
+matter_ws:
+  # The WebSocket URL of the Matter server (python-matter-server)
+  url: ws://localhost:5580/ws
