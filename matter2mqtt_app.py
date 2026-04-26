@@ -1,7 +1,6 @@
 """Main Matter2MQTT bridge application."""
 
 import asyncio
-import json
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,11 +12,13 @@ from constants import (
     SNAPSHOT_REFRESH_INTERVAL,
 )
 from models import EndpointInfo, MqttCommand
+import mqtt_bridge as mqtt_bridge_mod
 from mqtt_bridge import MqttBridge
 from matter_ws import MatterWS
 from matter_commander import MatterCommander
 from matter_helpers import extract_onoff_endpoints_from_node
-from topics import topic_state, topic_available, ha_discovery_topic
+from home_assistant import build_discovery_payload
+from topics import topic_state, topic_available
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,9 @@ except (FileNotFoundError, ValueError, yaml.YAMLError) as e:
     raise
 
 MATTER_WS_URL = config['matter_ws']['url']
+mqtt_bridge_mod.MQTT_HOST = str(config['mqtt']['host'])
+mqtt_bridge_mod.MQTT_PORT = int(config['mqtt']['port'])
+MQTT_DISCOVERY_PREFIX = str(config.get("mqtt", {}).get("discovery_prefix", "homeassistant"))
 
 
 class Matter2MQTT:
@@ -147,25 +151,10 @@ class Matter2MQTT:
 
     def publish_ha_discovery(self, ep: EndpointInfo):
         """Publish Home Assistant discovery message."""
-        payload = {
-            "name": f"Matter {ep.node_id}/{ep.endpoint}",
-            "state_topic": topic_state(ep.node_id, ep.endpoint),
-            "command_topic": f"matter/{ep.node_id}/{ep.endpoint}/set",
-            "availability_topic": topic_available(ep.node_id, ep.endpoint),
-            "payload_on": "ON",
-            "payload_off": "OFF",
-            "unique_id": f"matter_{ep.node_id}_{ep.endpoint}",
-            "device": {
-                "identifiers": [f"matter_node_{ep.node_id}"],
-                "name": f"Matter Node {ep.node_id}",
-                "manufacturer": "Matter",
-                "model": "OnOff Device",
-            },
-        }
-
+        discovery = build_discovery_payload(ep, MQTT_DISCOVERY_PREFIX)
         self.mqtt.publish_retained(
-            ha_discovery_topic(ep.node_id, ep.endpoint),
-            json.dumps(payload),
+            discovery.topic,
+            discovery.payload,
         )
         logger.debug(f"Home Assistant discovery published for node {ep.node_id} endpoint {ep.endpoint}")
 

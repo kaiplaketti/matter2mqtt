@@ -2,9 +2,12 @@
 # Copy this file to matter2mqtt.yaml and update with your actual settings
 
 mqtt:
-  # The MQTT broker settings (mosquitto)
+  # Mosquitto on the same host as matter2mqtt -> localhost.
+  # If the broker runs elsewhere, set that host/IP here instead.
   host: localhost
   port: 1883
+  # Home Assistant MQTT discovery root; default is "homeassistant"
+  discovery_prefix: homeassistant
 
 matter_ws:
   # The WebSocket URL of the Matter server (python-matter-server)

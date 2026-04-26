@@ -77,6 +77,7 @@ Default connection: `ws://localhost:5580/ws` (configurable in `matter2mqtt.yaml`
    mqtt:
      host: localhost      # Your MQTT broker host
      port: 1883          # Your MQTT broker port
+  discovery_prefix: homeassistant  # HA discovery root
 
    matter_ws:
      url: ws://localhost:5580/ws  # Your Matter Server WebSocket URL
@@ -100,7 +101,7 @@ Default connection: `ws://localhost:5580/ws` (configurable in `matter2mqtt.yaml`
 
 - **Device State:** `matter/{node_id}/{endpoint}/state` → `on` or `off`
 - **Device Availability:** `matter/{node_id}/{endpoint}/available` → `online` or `offline`
-- **Home Assistant Discovery:** `homeassistant/light/matter-{node_id}-{endpoint}/config`
+- **Home Assistant Discovery:** `{discovery_prefix}/light/matter_{node_id}_{endpoint}/config` (default `homeassistant`)
 
 ### Subscribing (MQTT to Bridge)
 
@@ -114,6 +115,7 @@ Edit `matter2mqtt.yaml` to customize:
 mqtt:
   host: localhost        # MQTT broker hostname/IP
   port: 1883            # MQTT broker port (default 1883)
+  discovery_prefix: homeassistant  # HA discovery root
 
 matter_ws:
   url: ws://localhost:5580/ws  # Matter Server WebSocket URL
@@ -126,6 +128,11 @@ Matter2MQTT publishes MQTT Discovery messages automatically. In Home Assistant:
 1. Ensure MQTT integration is configured
 2. Discovered devices appear in Settings → Devices & Services → MQTT
 3. Devices are created with automatic on/off control
+
+Notes:
+- Matter2MQTT publishes endpoint availability as `true` / `false` on `matter/.../available`.
+- Mijia2MQTT uses `online` / `offline` on `home/mijia/.../availability`.
+- This difference is intentional today, so harmonize payload strings only if all subscribers are updated.
 
 ## Troubleshooting
 

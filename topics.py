@@ -13,6 +13,12 @@ def topic_available(node_id: int, endpoint: int) -> str:
     return f"matter/{node_id}/{endpoint}/available"
 
 
-def ha_discovery_topic(node_id: int, endpoint: int) -> str:
+def ha_discovery_topic(
+    node_id: int,
+    endpoint: int,
+    *,
+    discovery_prefix: str = "homeassistant",
+    component: str = HA_DISCOVERY_DEVICE_CLASS,
+) -> str:
     """Get Home Assistant discovery topic for endpoint."""
-    return f"homeassistant/{HA_DISCOVERY_DEVICE_CLASS}/matter_{node_id}_{endpoint}/config"
+    return f"{discovery_prefix}/{component}/matter_{node_id}_{endpoint}/config"
