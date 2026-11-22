@@ -171,6 +171,21 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await commander.close()
 
+    async def test_command_connections_do_not_remain_idle_between_user_actions(self):
+        commander = MatterCommander(self.client.url)
+        try:
+            await commander.connect()
+            self.assertIsNone(commander.client.ws)
+            self.assertEqual(self.commands, [])
+            await commander.set_onoff(3, 1, "off")
+            self.assertIsNone(commander.client.ws)
+            await commander.read_onoff(3, 1)
+            self.assertIsNone(commander.client.ws)
+            self.assertEqual(self.connections, 3)
+            self.assertEqual(self.commands, ["device_command", "read_attribute"])
+        finally:
+            await commander.close()
+
 
 class FakeMQTT:
     def __init__(self):

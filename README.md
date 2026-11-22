@@ -125,6 +125,8 @@ To use relay control, explicitly set `matter_ws.commands_enabled: true` and rest
 
 Commands are sent once and are not automatically replayed after a transport failure. Retained MQTT commands are ignored. Reported states are republished after a command attempt, including failures, so a UI's optimistic state is corrected. The regression tests use a local fake server and never operate real relays.
 
+Each command and confirming read uses a fresh, short-lived WebSocket connection. The command socket is closed between user actions, so an idle server heartbeat cannot leave the next command writing to a stale transport. The separate snapshot connection continues polling normally.
+
 Snapshots use `get_nodes` every 30 seconds. The WebSocket client matches response IDs and reconnects after a dropped connection. MQTT reconnection republishes retained discovery, availability and state, even when the values have not changed.
 
 Startup waits up to 15 seconds for an accepted MQTT connection. Startup errors propagate to a nonzero process exit after cleanup, so a supervisor configured with `Restart=on-failure` can retry while dependent services are starting. The bridge does not restart the broker or Matter Server.
