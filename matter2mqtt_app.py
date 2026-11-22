@@ -19,6 +19,10 @@ from matter_ws import MatterWS
 from matter_commander import MatterCommander
 from matter_helpers import extract_onoff_endpoints_from_node
 from home_assistant import build_discovery_payload
+from electrical_measurements import (
+    extract_electrical_endpoints, build_measurement_discovery,
+    measurement_state_topic, measurement_availability_topic,
+)
 from topics import topic_state, topic_available
 
 logger = logging.getLogger(__name__)
@@ -94,6 +98,8 @@ class Matter2MQTT:
         self.last_state: Dict[Tuple[int, int], Optional[bool]] = {}
         self.last_avail: Dict[Tuple[int, int], Optional[bool]] = {}
         self.last_mqtt_generation = 0
+        self.last_measurements = {}
+        self.last_measurement_availability = {}
 
         self.running = True
 
@@ -193,9 +199,13 @@ class Matter2MQTT:
         for n in nodes:
             endpoints.extend(extract_onoff_endpoints_from_node(n))
         endpoints = self.endpoint_map.mqtt_snapshot(endpoints)
+        electrical = []
+        for node in nodes:
+            electrical.extend(extract_electrical_endpoints(node))
+        electrical = self.endpoint_map.mqtt_snapshot(electrical)
 
-        if not endpoints:
-            logger.debug("No OnOff endpoints found")
+        if not endpoints and not electrical:
+            logger.debug("No supported endpoints found")
             return
 
         for ep in endpoints:
@@ -223,10 +233,32 @@ class Matter2MQTT:
                     f"Published state for node {ep.node_id} endpoint {ep.endpoint}: {state_value}"
                 )
 
+        self.publish_electrical_measurements(electrical, force_publish=force_publish)
         self.last_mqtt_generation = generation
         # Log discovered endpoints
         discovered = ", ".join([f"{e.node_id}/{e.endpoint}" for e in endpoints])
         logger.info(f"Discovered OnOff endpoints: {discovered}")
+
+    def publish_electrical_measurements(self, endpoints, *, force_publish=False):
+        """Publish supported measurements without sending any device commands."""
+        for ep in endpoints:
+            for metric, value in ep.values.items():
+                key = (ep.node_id, ep.endpoint, metric)
+                discovery = build_measurement_discovery(ep, metric, MQTT_DISCOVERY_PREFIX)
+                self.mqtt.publish_retained(discovery.topic, discovery.payload)
+                available = ep.available and value is not None
+                previous_available = self.last_measurement_availability.get(key)
+                if force_publish or previous_available != available:
+                    self.mqtt.publish_retained(
+                        measurement_availability_topic(ep, metric), 'true' if available else 'false',
+                    )
+                    self.last_measurement_availability[key] = available
+                if not available:
+                    self.last_measurements.pop(key, None)
+                    continue
+                if force_publish or self.last_measurements.get(key) != value:
+                    self.mqtt.publish_retained(measurement_state_topic(ep, metric), str(value))
+                    self.last_measurements[key] = value
 
     async def command_consumer_task(self):
         """Consume commands from MQTT queue and send to Matter."""

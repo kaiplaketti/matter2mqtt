@@ -20,6 +20,7 @@ from matter_commander import MatterCommander
 from endpoint_mapping import EndpointMap
 from models import EndpointInfo, MqttCommand
 from mqtt_bridge import MqttBridge
+from electrical_measurements import extract_electrical_endpoints, build_measurement_discovery
 
 # App configuration is loaded at import time. Use an isolated fixture so a clean
 # checkout needs no local config and tests never read deployment settings.
@@ -41,6 +42,75 @@ NODES = [
     {"node_id": n, "available": n != 4, "attributes": {"1/6/0": False}}
     for n in (3, 4, 5)
 ]
+
+
+def metered_node(*, available=True, attributes=None):
+    return {
+        'node_id': 6, 'available': available,
+        'attributes': attributes if attributes is not None else {
+            '1/6/0': False, '1/144/4': 230125, '1/144/5': 2345,
+            '1/144/8': 500125, '1/145/1': {'0': 12345678},
+        },
+    }
+
+
+class ElectricalParsingTests(unittest.TestCase):
+    def test_standard_units_are_converted_to_watts_volts_amps_and_kwh(self):
+        ep, = extract_electrical_endpoints(metered_node())
+        self.assertEqual(ep.values, {
+            'power': 500.125, 'voltage': 230.125, 'current': 2.345,
+            'energy_imported': 12.345678,
+        })
+        self.assertNotIn('energy_exported', ep.values)
+
+    def test_zero_is_a_real_measurement_and_negative_power_is_preserved(self):
+        ep, = extract_electrical_endpoints(metered_node(attributes={
+            '1/144/8': -150000, '1/144/5': 0, '1/145/1': {'0': 0},
+        }))
+        self.assertEqual(ep.values, {'power': -150.0, 'current': 0.0, 'energy_imported': 0.0})
+
+    def test_current_plugs_without_measurement_clusters_create_no_sensors(self):
+        self.assertEqual(extract_electrical_endpoints(metered_node(attributes={
+            '1/6/0': True, '1/29/1': [3,4,6,29], '0/54/4': -40,
+        })), [])
+
+    def test_null_and_invalid_values_are_unavailable_and_not_zero(self):
+        for value in (None, True, '123', float('nan'), float('inf'), {}, 10**400):
+            with self.subTest(value=type(value).__name__):
+                ep, = extract_electrical_endpoints(metered_node(attributes={'1/144/8':value}))
+                self.assertIsNone(ep.values['power'])
+
+    def test_missing_supported_attribute_is_unavailable(self):
+        ep, = extract_electrical_endpoints(metered_node(attributes={'1/144/65531':[8,65531]}))
+        self.assertEqual(ep.values, {'power':None})
+
+    def test_energy_structs_and_exported_energy(self):
+        for field in ('0', 0, 'energy', 'Energy'):
+            with self.subTest(field=field):
+                ep, = extract_electrical_endpoints(metered_node(attributes={'1/145/2':{field:2500000}}))
+                self.assertEqual(ep.values, {'energy_exported':2.5})
+        ep, = extract_electrical_endpoints(metered_node(attributes={'1/145/1':{'0':-1}}))
+        self.assertIsNone(ep.values['energy_imported'])
+
+    def test_multiple_measurement_endpoints_do_not_mix_their_values(self):
+        result = extract_electrical_endpoints(metered_node(attributes={
+            '1/144/8':1000, '2/144/8':2000, '2/145/1':{'0':3000000}, 'bad':0,
+        }))
+        self.assertEqual([(e.endpoint,e.values) for e in result], [
+            (1,{'power':1.0}), (2,{'power':2.0,'energy_imported':3.0}),
+        ])
+
+    def test_discovery_has_units_availability_and_no_command_topic(self):
+        ep, = extract_electrical_endpoints(metered_node())
+        for metric, unit in [('power','W'),('voltage','V'),('current','A'),('energy_imported','kWh')]:
+            d=build_measurement_discovery(ep,metric,'custom')
+            payload=json.loads(d.payload)
+            self.assertEqual(d.topic,f'custom/sensor/matter_6_1_{metric}/config')
+            self.assertEqual(payload['unit_of_measurement'],unit)
+            self.assertEqual(payload['unique_id'],f'matter_6_1_{metric}')
+            self.assertNotIn('command_topic',payload)
+            self.assertEqual(payload['availability_topic'],f'matter/6/1/{metric}/available')
+            self.assertEqual(payload['state_class'],'total_increasing' if metric.startswith('energy') else 'measurement')
 
 
 class LifecycleTests(unittest.TestCase):
@@ -234,6 +304,70 @@ class SnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.app.mqtt.reject_states = False
         await self.app.refresh_snapshot()
         self.assertIn(("matter/3/1/state", "OFF"), self.app.mqtt.messages)
+
+    async def electrical_snapshot(self, node):
+        async def snapshot():
+            return [node]
+        self.app.matter_ws.snapshot_nodes = snapshot
+        await self.app.refresh_snapshot()
+
+    async def test_measurements_keep_legacy_identity_without_adding_relay(self):
+        self.app.endpoint_map = EndpointMap({'6/1':'1/1'})
+        await self.electrical_snapshot(metered_node())
+        published = dict(self.app.mqtt.messages)
+        self.assertEqual(published['matter/1/1/power/state'],'500.125')
+        self.assertEqual(published['matter/1/1/energy_imported/state'],'12.345678')
+        self.assertEqual(json.loads(published['homeassistant/sensor/matter_1_1_power/config'])['unique_id'],'matter_1_1_power')
+        self.assertIn('homeassistant/light/matter_1_1/config',published)
+        self.assertFalse(any('/6/1/' in topic or topic.endswith('/set') for topic in published))
+
+    async def test_measurement_reconnect_republishes_unchanged_values(self):
+        await self.electrical_snapshot(metered_node())
+        first = self.app.mqtt.messages.copy()
+        self.app.mqtt.messages.clear()
+        await self.app.refresh_snapshot()
+        self.assertTrue(all(topic.endswith('/config') for topic,_ in self.app.mqtt.messages))
+        self.app.mqtt.messages.clear()
+        self.app.mqtt.connection_generation += 1
+        await self.app.refresh_snapshot()
+        self.assertEqual(self.app.mqtt.messages,first)
+
+    async def test_null_measurement_marks_unavailable_without_false_zero(self):
+        await self.electrical_snapshot(metered_node(attributes={'1/6/0':False,'1/144/8':None}))
+        published=dict(self.app.mqtt.messages)
+        self.assertEqual(published['matter/6/1/power/available'],'false')
+        self.assertNotIn('matter/6/1/power/state',published)
+
+    async def test_measurement_on_unavailable_node_does_not_publish_cached_value(self):
+        await self.electrical_snapshot(metered_node(available=False))
+        published=dict(self.app.mqtt.messages)
+        self.assertEqual(published['matter/6/1/power/available'],'false')
+        self.assertNotIn('matter/6/1/power/state',published)
+
+    async def test_missing_value_recovery_publishes_again_even_if_unchanged(self):
+        await self.electrical_snapshot(metered_node())
+        await self.electrical_snapshot(metered_node(attributes={'1/6/0':False,'1/144/8':None}))
+        self.app.mqtt.messages.clear()
+        await self.electrical_snapshot(metered_node())
+        self.assertIn(('matter/6/1/power/state','500.125'),self.app.mqtt.messages)
+        self.assertIn(('matter/6/1/power/available','true'),self.app.mqtt.messages)
+
+    async def test_electrical_endpoint_without_relay_is_supported(self):
+        await self.electrical_snapshot(metered_node(attributes={'2/144/8':1000}))
+        self.assertIn(('matter/6/2/power/state','1.0'),self.app.mqtt.messages)
+        self.assertFalse(any('/light/' in topic for topic,_ in self.app.mqtt.messages))
+
+    async def test_failed_measurement_publish_is_retried_on_next_refresh(self):
+        # A measurement-only node reaches the measurement state publication before
+        # FakeMQTT rejects it. No value may be remembered as successfully sent.
+        self.app.mqtt.reject_states=True
+        with self.assertRaises(ConnectionError):
+            await self.electrical_snapshot(metered_node(attributes={'2/144/8':1000}))
+        self.assertEqual(self.app.last_measurements,{})
+        self.assertEqual(self.app.last_mqtt_generation,0)
+        self.app.mqtt.reject_states=False
+        await self.app.refresh_snapshot()
+        self.assertIn(('matter/6/2/power/state','1.0'),self.app.mqtt.messages)
 
     async def test_status_only_mode_does_not_construct_a_commander(self):
         self.assertFalse(self.app.commands_enabled)

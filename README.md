@@ -133,6 +133,34 @@ Startup waits up to 15 seconds for an accepted MQTT connection. Startup errors p
 
 ## Home Assistant Integration
 
+### Electrical measurements (Matter 1.3)
+
+When a device actually exposes the standard Electrical Power Measurement (144)
+or Electrical Energy Measurement (145) clusters, the bridge also publishes
+read-only MQTT Discovery sensors for supported values:
+
+- Active power (W), voltage (V), and active current (A).
+- Cumulative imported energy (kWh), and exported energy if the device provides it.
+
+Each metric uses `matter/<node>/<endpoint>/<metric>/state` and its own
+`.../<metric>/available` topic. Discovery is published under
+`<discovery_prefix>/sensor/matter_<node>_<endpoint>_<metric>/config`.
+These sensors have no command topic. Existing relay discovery and endpoint
+aliases retain their identities.
+
+Only supported measurements create sensors. A null, invalid or missing sample
+is unavailable and is never replaced with zero; zero is published when actually
+reported by the device. The bridge converts standard mV/mA/mW to V/A/W and mWh
+to kWh, and uses the device's cumulative energy counter rather than estimating
+consumption from power. MQTT reconnection republishes discovery and valid
+measurements even when the values did not change.
+
+Some plugs require a manufacturer firmware update before they expose these
+clusters. This bridge does not install device firmware, reset devices, or create
+placeholder power/energy values for plugs that only expose OnOff. After a device
+update, the Matter Server must interview the device so its snapshot includes the
+new clusters. The bridge then discovers the measurements automatically.
+
 Matter2MQTT publishes MQTT Discovery messages automatically. In Home Assistant:
 
 1. Ensure MQTT integration is configured
