@@ -9,7 +9,7 @@ Matter2MQTT is a bridge that:
 - **Connects to a Matter network** via the Python Matter Server WebSocket interface
 - **Monitors Matter device states** - tracks OnOff cluster status for connected devices
 - **Publishes to MQTT** - exposes device states as MQTT topics for home automation systems
-- **Receives MQTT commands** - allows control of Matter devices through MQTT topics
+- **Optional MQTT commands** - relay control can be enabled explicitly; disabled by default
 - **Supports Home Assistant** - publishes MQTT Discovery messages for automatic device integration
 - **Maintains device availability** - tracks and publishes device availability status
 
@@ -45,19 +45,13 @@ Default connection: `ws://localhost:5580/ws` (configurable in `matter2mqtt.yaml`
 
 ### 3. Python Runtime
 
-- **Python 3.9 or later**
+- **Python 3.11 or later**
 
 ## Installation
 
 1. **Clone or download this project**
 
 2. **Install Python dependencies:**
-
-   ```bash
-   pip install paho-mqtt pyyaml matter-server
-   ```
-
-   Or install from `requirements.txt` if available:
 
    ```bash
    pip install -r requirements.txt
@@ -77,10 +71,11 @@ Default connection: `ws://localhost:5580/ws` (configurable in `matter2mqtt.yaml`
    mqtt:
      host: localhost      # Your MQTT broker host
      port: 1883          # Your MQTT broker port
-  discovery_prefix: homeassistant  # HA discovery root
+     discovery_prefix: homeassistant  # HA discovery root
 
    matter_ws:
      url: ws://localhost:5580/ws  # Your Matter Server WebSocket URL
+     commands_enabled: false
    ```
 
 4. **Run the bridge:**
@@ -99,13 +94,13 @@ Default connection: `ws://localhost:5580/ws` (configurable in `matter2mqtt.yaml`
 
 ### Publishing (Bridge to MQTT)
 
-- **Device State:** `matter/{node_id}/{endpoint}/state` → `on` or `off`
-- **Device Availability:** `matter/{node_id}/{endpoint}/available` → `online` or `offline`
+- **Device State:** `matter/{node_id}/{endpoint}/state` → `ON` or `OFF`
+- **Device Availability:** `matter/{node_id}/{endpoint}/available` → `true` or `false`
 - **Home Assistant Discovery:** `{discovery_prefix}/light/matter_{node_id}_{endpoint}/config` (default `homeassistant`)
 
 ### Subscribing (MQTT to Bridge)
 
-- **Command Topic:** `matter/{node_id}/{endpoint}/set` ← `on`, `off`, or `toggle`
+- **Command Topic:** `matter/{node_id}/{endpoint}/set` ← `on`, `off`, or `toggle`; subscribed only when `matter_ws.commands_enabled` is `true`. Retained commands are ignored.
 
 ## Configuration
 
@@ -119,7 +114,18 @@ mqtt:
 
 matter_ws:
   url: ws://localhost:5580/ws  # Matter Server WebSocket URL
+  commands_enabled: false
 ```
+
+### Status-only mode and recovery
+
+Status-only mode is the default, including when `commands_enabled` is omitted from an existing configuration. Discovery, availability and reported device states are published normally. The bridge does not subscribe to relay commands or construct a Matter command client in this mode.
+
+To use relay control, first provide compatible `python-matter-server` client and CHIP cluster dependencies in the bridge environment, then explicitly set `matter_ws.commands_enabled: true`. Those optional dependencies are not installed by `requirements.txt`. A missing command dependency fails startup when control is enabled. Device-command integration requires separate validation; the regression tests never operate real relays.
+
+Snapshots use `get_nodes` every 30 seconds. The WebSocket client matches response IDs and reconnects after a dropped connection. MQTT reconnection republishes retained discovery, availability and state, even when the values have not changed.
+
+Startup waits up to 15 seconds for an accepted MQTT connection. Startup errors propagate to a nonzero process exit after cleanup, so a supervisor configured with `Restart=on-failure` can retry while dependent services are starting. The bridge does not restart the broker or Matter Server.
 
 ## Home Assistant Integration
 
@@ -127,7 +133,7 @@ Matter2MQTT publishes MQTT Discovery messages automatically. In Home Assistant:
 
 1. Ensure MQTT integration is configured
 2. Discovered devices appear in Settings → Devices & Services → MQTT
-3. Devices are created with automatic on/off control
+3. Devices report state and availability; relay control is optional as described above
 
 Notes:
 - Matter2MQTT publishes endpoint availability as `true` / `false` on `matter/.../available`.
@@ -139,7 +145,17 @@ Notes:
 - **Can't connect to MQTT**: Verify MQTT broker is running and accessible
 - **Can't connect to Matter Server**: Verify Matter Server is running and WebSocket URL is correct
 - **No devices showing up**: Ensure devices are commissioned in the Matter network
-- **Commands not working**: Check Matter Server logs for OnOff cluster support
+- **Commands not working**: Check `matter_ws.commands_enabled`, optional command dependencies and Matter Server logs for OnOff cluster support
+
+## Tests
+
+After installing `requirements.txt`, run:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The suite creates its own temporary configuration and uses local WebSocket/MQTT fakes. It needs no broker, Matter Server or commissioned device and sends no commands to real relays. CI also runs the suite with pytest on Python 3.11, 3.12 and 3.13.
 
 ## Architecture
 

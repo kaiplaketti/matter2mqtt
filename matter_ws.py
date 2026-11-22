@@ -1,4 +1,4 @@
-"""Matter WebSocket client."""
+"""Serialized, reconnectable Matter WebSocket snapshot client."""
 
 import asyncio
 import json
@@ -13,69 +13,79 @@ logger = logging.getLogger(__name__)
 
 
 class MatterWS:
-    """
-    Raw WS client for:
-      - HELLO
-      - start_listening (snapshot)
-    """
+    """Poll get_nodes without opening an unsolicited event stream."""
 
     def __init__(self, url: str):
         self.url = url
         self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self.session: Optional[aiohttp.ClientSession] = None
         self._msg_id = 0
-
-    def _next_id(self) -> str:
-        self._msg_id += 1
-        return str(self._msg_id)
+        self._request_lock = asyncio.Lock()
 
     async def connect(self) -> Dict[str, Any]:
-        """Connect to Matter WebSocket server."""
+        await self.close()
         try:
             self.session = aiohttp.ClientSession()
-            self.ws = await self.session.ws_connect(self.url)
-            logger.info(f"Connecting to Matter WebSocket at {self.url}")
-            hello = await self._recv_json(timeout=MATTER_WS_CONNECT_TIMEOUT)
+            self.ws = await asyncio.wait_for(
+                self.session.ws_connect(self.url), MATTER_WS_CONNECT_TIMEOUT
+            )
+            hello = await self._recv_json(MATTER_WS_CONNECT_TIMEOUT)
             logger.info("Matter WebSocket connection established")
             return hello
-        except Exception as e:
-            logger.error(f"Failed to connect to Matter WebSocket: {e}")
+        except (Exception, asyncio.CancelledError):
+            await self.close()
             raise
 
     async def close(self):
-        """Close WebSocket connection."""
-        if self.ws:
+        if self.ws is not None:
             await self.ws.close()
-        if self.session:
+            self.ws = None
+        if self.session is not None:
             await self.session.close()
+            self.session = None
 
     async def _recv_json(self, timeout: float) -> Dict[str, Any]:
-        """Receive and parse JSON message."""
         if self.ws is None:
-            raise RuntimeError("WebSocket not connected")
+            raise ConnectionError("Matter WebSocket not connected")
         msg = await self.ws.receive(timeout=timeout)
-        if msg.type == aiohttp.WSMsgType.TEXT:
-            return json.loads(msg.data)
-        raise RuntimeError(f"Unexpected WebSocket message type: {msg.type}")
+        if msg.type != aiohttp.WSMsgType.TEXT:
+            raise ConnectionError(f"Unexpected WebSocket message type: {msg.type}")
+        result = json.loads(msg.data)
+        if not isinstance(result, dict):
+            raise ValueError("Matter WebSocket response is not an object")
+        return result
 
-    async def send_command(self, command: str, args: Dict[str, Any], timeout: float = MATTER_SEND_COMMAND_TIMEOUT) -> Dict[str, Any]:
-        """
-        Sends a {"message_id","command","args"} frame and waits one response.
-        """
-        if self.ws is None:
-            raise RuntimeError("WebSocket not connected")
-        frame = {"message_id": self._next_id(), "command": command, "args": args}
-        logger.debug(f"Sending Matter command: {command}")
-        await self.ws.send_str(json.dumps(frame))
-        return await self._recv_json(timeout=timeout)
+    async def send_command(
+        self, command: str, args: Dict[str, Any],
+        timeout: float = MATTER_SEND_COMMAND_TIMEOUT,
+    ) -> Dict[str, Any]:
+        async with self._request_lock:
+            try:
+                if self.ws is None or self.ws.closed:
+                    await self.connect()
+                self._msg_id += 1
+                message_id = str(self._msg_id)
+                frame = {"message_id": message_id, "command": command, "args": args}
+                async with asyncio.timeout(timeout):
+                    await self.ws.send_json(frame)
+                    while True:
+                        reply = await self._recv_json(timeout)
+                        if reply.get("message_id") != message_id:
+                            continue
+                        if "error_code" in reply:
+                            raise RuntimeError(
+                                f"Matter {command} failed ({reply['error_code']}): "
+                                f"{reply.get('details', '')}"
+                            )
+                        return reply
+            except (Exception, asyncio.CancelledError):
+                # The next snapshot establishes a fresh connection.
+                await self.close()
+                raise
 
     async def snapshot_nodes(self) -> List[Dict[str, Any]]:
-        """Get snapshot of all nodes."""
-        resp = await self.send_command("start_listening", {}, timeout=MATTER_SEND_COMMAND_TIMEOUT)
-        # resp: { "message_id": "...", "result": [ ...nodes... ] }
-        nodes = resp.get("result", [])
-        if not isinstance(nodes, list):
-            logger.warning("Unexpected response format from Matter WebSocket")
-            return []
-        logger.debug(f"Retrieved {len(nodes)} nodes from Matter")
+        response = await self.send_command("get_nodes", {})
+        nodes = response.get("result")
+        if not isinstance(nodes, list) or not all(isinstance(n, dict) for n in nodes):
+            raise ValueError("Matter get_nodes returned an invalid node list")
         return nodes

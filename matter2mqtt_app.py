@@ -71,6 +71,9 @@ MATTER_WS_URL = config['matter_ws']['url']
 mqtt_bridge_mod.MQTT_HOST = str(config['mqtt']['host'])
 mqtt_bridge_mod.MQTT_PORT = int(config['mqtt']['port'])
 MQTT_DISCOVERY_PREFIX = str(config.get("mqtt", {}).get("discovery_prefix", "homeassistant"))
+COMMANDS_ENABLED = config.get("matter_ws", {}).get("commands_enabled", False)
+if not isinstance(COMMANDS_ENABLED, bool):
+    raise ValueError("matter_ws.commands_enabled must be a YAML boolean")
 
 
 class Matter2MQTT:
@@ -80,19 +83,21 @@ class Matter2MQTT:
         self.loop = asyncio.get_running_loop()
         self.cmd_queue: asyncio.Queue[MqttCommand] = asyncio.Queue()
 
-        self.mqtt = MqttBridge(self.loop, self.cmd_queue)
+        self.commands_enabled = COMMANDS_ENABLED
+        self.mqtt = MqttBridge(self.loop, self.cmd_queue, commands_enabled=self.commands_enabled)
         self.matter_ws = MatterWS(MATTER_WS_URL)
-        self.matter_cmd = MatterCommander(MATTER_WS_URL)
+        self.matter_cmd = MatterCommander(MATTER_WS_URL) if self.commands_enabled else None
 
         # Track last published states to avoid spamming
         self.last_state: Dict[Tuple[int, int], Optional[bool]] = {}
         self.last_avail: Dict[Tuple[int, int], Optional[bool]] = {}
+        self.last_mqtt_generation = 0
 
         self.running = True
 
     async def start(self):
         """Start the bridge."""
-        self.mqtt.connect()
+        await self.mqtt.connect()
         logger.info("MQTT bridge connected")
 
         hello = await self.matter_ws.connect()
@@ -101,18 +106,19 @@ class Matter2MQTT:
             f"sdk={hello.get('sdk_version')}"
         )
 
-        try:
+        if self.commands_enabled:
             await self.matter_cmd.connect()
             logger.info("Matter commander connected (can send OnOff commands)")
-        except Exception as e:
-            logger.warning(f"Matter commander not available, commands disabled: {e}")
+        else:
+            logger.info("Status-only mode: Matter relay commands disabled")
 
         await self.refresh_snapshot()
 
         self._tasks = [
             asyncio.create_task(self.periodic_refresh_task(), name="refresh"),
-            asyncio.create_task(self.command_consumer_task(), name="cmd_consumer"),
         ]
+        if self.commands_enabled:
+            self._tasks.append(asyncio.create_task(self.command_consumer_task(), name="cmd_consumer"))
 
         # Wait until tasks finish (they won't until stopped)
         await asyncio.gather(*self._tasks)
@@ -145,7 +151,8 @@ class Matter2MQTT:
         except Exception:
             pass
         try:
-            await self.matter_cmd.close()
+            if self.matter_cmd is not None:
+                await self.matter_cmd.close()
         except Exception:
             pass
 
@@ -169,16 +176,16 @@ class Matter2MQTT:
             except Exception as e:
                 if not self.running:
                     break
-                # Ignore shutdown/closing transport noise
-                msg = str(e)
-                if "closing transport" in msg or "Cannot write to closing transport" in msg:
-                    logger.debug("WebSocket closing during shutdown")
-                    break
-                logger.error(f"Snapshot refresh error: {e}", exc_info=True)
+                logger.error("Snapshot refresh failed; retrying on next interval: %s", e)
 
     async def refresh_snapshot(self):
         """Refresh snapshot and publish state."""
         nodes = await self.matter_ws.snapshot_nodes()
+        if not self.mqtt.connected.is_set():
+            logger.warning("MQTT disconnected; snapshot will be published after reconnection")
+            return
+        generation = self.mqtt.connection_generation
+        force_publish = generation != self.last_mqtt_generation
         # Extract onoff endpoints for all nodes
         endpoints: List[EndpointInfo] = []
         for n in nodes:
@@ -196,38 +203,35 @@ class Matter2MQTT:
             key = (ep.node_id, ep.endpoint)
 
             # availability
-            if self.last_avail.get(key) != ep.available:
-                self.last_avail[key] = ep.available
+            if force_publish or self.last_avail.get(key) != ep.available:
                 avail_value = "true" if ep.available else "false"
                 self.mqtt.publish_retained(topic_available(ep.node_id, ep.endpoint), avail_value)
+                self.last_avail[key] = ep.available
                 logger.info(
                     f"Published availability for node {ep.node_id} endpoint {ep.endpoint}: {avail_value}"
                 )
 
             # state
-            if ep.onoff is not None and self.last_state.get(key) != ep.onoff:
-                self.last_state[key] = ep.onoff
+            if ep.onoff is not None and (force_publish or self.last_state.get(key) != ep.onoff):
                 state_value = "ON" if ep.onoff else "OFF"
                 self.mqtt.publish_retained(topic_state(ep.node_id, ep.endpoint), state_value)
+                self.last_state[key] = ep.onoff
                 logger.info(
                     f"Published state for node {ep.node_id} endpoint {ep.endpoint}: {state_value}"
                 )
 
+        self.last_mqtt_generation = generation
         # Log discovered endpoints
         discovered = ", ".join([f"{e.node_id}/{e.endpoint}" for e in endpoints])
         logger.info(f"Discovered OnOff endpoints: {discovered}")
 
     async def command_consumer_task(self):
         """Consume commands from MQTT queue and send to Matter."""
+        if not self.commands_enabled:
+            return
         while self.running:
             cmd = await self.cmd_queue.get()
             logger.info(f"Processing MQTT command: node {cmd.node_id} endpoint {cmd.endpoint} action {cmd.action}")
-
-            # Optimistically publish desired state immediately (optional)
-            if cmd.action in ("on", "off"):
-                desired = True if cmd.action == "on" else False
-                state_value = "ON" if desired else "OFF"
-                self.mqtt.publish_retained(topic_state(cmd.node_id, cmd.endpoint), state_value)
 
             # Send to Matter
             try:

@@ -14,18 +14,7 @@ async def main():
     """Main entry point."""
     app = Matter2MQTT()
     loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
-
-    async def runner():
-        try:
-            await app.start()
-        except asyncio.CancelledError:
-            pass
-        finally:
-            await app.stop()
-            stop_event.set()
-
-    task = loop.create_task(runner())
+    task = loop.create_task(app.start())
 
     def _shutdown():
         if not task.done():
@@ -38,7 +27,15 @@ async def main():
         except NotImplementedError:
             pass
 
-    await stop_event.wait()
+    try:
+        # Await the task itself so startup/runtime failures reach systemd.
+        await task
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await app.stop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
 
 
 if __name__ == "__main__":
