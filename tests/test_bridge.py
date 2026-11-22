@@ -1,6 +1,7 @@
 """Regression checks use local fakes only; they never send relay commands."""
 
 import asyncio
+import contextlib
 import os
 import pathlib
 import subprocess
@@ -8,12 +9,14 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 from aiohttp import web
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from matter_ws import MatterWS
+from matter_commander import MatterCommander
+from models import MqttCommand
 from mqtt_bridge import MqttBridge
 
 # App configuration is loaded at import time. Use an isolated fixture so a clean
@@ -64,6 +67,7 @@ runpy.run_path(sys.argv[1], run_name="__main__")
 class WebSocketTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.commands = []
+        self.frames = []
         self.connections = 0
         self.drop_next = False
         self.error_next = False
@@ -76,6 +80,7 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
             async for message in ws:
                 frame = message.json()
                 self.commands.append(frame["command"])
+                self.frames.append(frame)
                 if self.drop_next:
                     self.drop_next = False
                     await ws.close()
@@ -86,7 +91,12 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                     self.error_next = False
                     await ws.send_json({"message_id": frame["message_id"], "error_code": 99, "details": "fake error"})
                 else:
-                    await ws.send_json({"message_id": frame["message_id"], "result": NODES})
+                    result = NODES
+                    if frame["command"] == "device_command":
+                        result = None
+                    elif frame["command"] == "read_attribute":
+                        result = {frame["args"]["attribute_path"]: True}
+                    await ws.send_json({"message_id": frame["message_id"], "result": result})
             return ws
 
         app = web.Application()
@@ -120,6 +130,46 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "fake error"):
             await self.client.snapshot_nodes()
         self.assertEqual(await self.client.snapshot_nodes(), NODES)
+
+    async def test_onoff_json_matches_server_api_and_reads_back_state(self):
+        commander = MatterCommander(self.client.url)
+        try:
+            for action, name in [("on", "On"), ("off", "Off"), ("toggle", "Toggle")]:
+                await commander.set_onoff(3, 1, action)
+                self.assertEqual(self.frames[-1]["command"], "device_command")
+                self.assertEqual(self.frames[-1]["args"], {
+                    "node_id": 3, "endpoint_id": 1, "cluster_id": 6,
+                    "command_name": name, "payload": {},
+                })
+            self.assertTrue(await commander.read_onoff(3, 1))
+            self.assertEqual(self.frames[-1]["args"], {
+                "node_id": 3, "attribute_path": "1/6/0",
+            })
+        finally:
+            await commander.close()
+
+    async def test_uncertain_toggle_is_not_replayed_after_connection_drop(self):
+        commander = MatterCommander(self.client.url)
+        self.drop_next = True
+        try:
+            with self.assertRaises(ConnectionError):
+                await commander.set_onoff(3, 1, "toggle")
+            self.assertEqual(self.commands, ["device_command"])
+            self.assertEqual(self.connections, 1)
+            # The next independent read can reconnect, without resending Toggle.
+            self.assertTrue(await commander.read_onoff(3, 1))
+            self.assertEqual(self.commands, ["device_command", "read_attribute"])
+        finally:
+            await commander.close()
+
+    async def test_invalid_action_never_opens_a_connection(self):
+        commander = MatterCommander(self.client.url)
+        try:
+            with self.assertRaises(ValueError):
+                await commander.set_onoff(3, 1, "invalid")
+            self.assertEqual(self.connections, 0)
+        finally:
+            await commander.close()
 
 
 class FakeMQTT:
@@ -173,8 +223,59 @@ class SnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.app.matter_cmd)
         await self.app.command_consumer_task()
 
+    async def test_failed_command_restores_reported_state_without_optimistic_on(self):
+        self.app.commands_enabled = True
+        self.app.matter_cmd = types.SimpleNamespace(
+            set_onoff=AsyncMock(side_effect=RuntimeError("fake device error")),
+            read_onoff=AsyncMock(),
+        )
+        # The known physical state is already OFF; it must be republished anyway.
+        self.app.last_state = {(n, 1): False for n in (3, 4, 5)}
+        self.app.last_mqtt_generation = 1
+        task = asyncio.create_task(self.app.command_consumer_task())
+        try:
+            with self.assertLogs("matter2mqtt_app", level="ERROR"):
+                await self.app.cmd_queue.put(MqttCommand(3, 1, "on"))
+                await asyncio.wait_for(self.app.cmd_queue.join(), 2)
+            self.assertIn(("matter/3/1/state", "OFF"), self.app.mqtt.messages)
+            self.assertNotIn(("matter/3/1/state", "ON"), self.app.mqtt.messages)
+            self.app.matter_cmd.read_onoff.assert_not_awaited()
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def test_successful_command_reads_back_before_publishing(self):
+        self.app.commands_enabled = True
+        self.app.matter_cmd = types.SimpleNamespace(
+            set_onoff=AsyncMock(), read_onoff=AsyncMock(return_value=False),
+        )
+        task = asyncio.create_task(self.app.command_consumer_task())
+        try:
+            await self.app.cmd_queue.put(MqttCommand(3, 1, "off"))
+            await asyncio.wait_for(self.app.cmd_queue.join(), 2)
+            self.app.matter_cmd.set_onoff.assert_awaited_once_with(3, 1, "off", timeout=15.0)
+            self.app.matter_cmd.read_onoff.assert_awaited_once_with(3, 1)
+            self.assertIn(("matter/3/1/state", "OFF"), self.app.mqtt.messages)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
 
 class CommandGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_enabled_mode_subscribes_and_enqueues_nonretained_ui_commands(self):
+        queue = asyncio.Queue()
+        bridge = MqttBridge(asyncio.get_running_loop(), queue, commands_enabled=True)
+        client = Mock()
+        bridge._on_connect(client, None, None, 0, None)
+        bridge._on_message(client, None, types.SimpleNamespace(
+            topic="matter/4/1/set", payload=b"OFF", retain=False,
+        ))
+        await asyncio.sleep(0)
+        client.subscribe.assert_called_once_with("matter/+/+/set", qos=1)
+        self.assertEqual(await asyncio.wait_for(queue.get(), 1), MqttCommand(4, 1, "off"))
+
     async def test_status_only_mode_never_subscribes_or_enqueues_commands(self):
         queue = asyncio.Queue()
         bridge = MqttBridge(asyncio.get_running_loop(), queue, commands_enabled=False)

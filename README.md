@@ -121,7 +121,9 @@ matter_ws:
 
 Status-only mode is the default, including when `commands_enabled` is omitted from an existing configuration. Discovery, availability and reported device states are published normally. The bridge does not subscribe to relay commands or construct a Matter command client in this mode.
 
-To use relay control, first provide compatible `python-matter-server` client and CHIP cluster dependencies in the bridge environment, then explicitly set `matter_ws.commands_enabled: true`. Those optional dependencies are not installed by `requirements.txt`. A missing command dependency fails startup when control is enabled. Device-command integration requires separate validation; the regression tests never operate real relays.
+To use relay control, explicitly set `matter_ws.commands_enabled: true` and restart the bridge. The bridge sends OnOff commands through the Matter Server's `device_command` WebSocket API; it does not need a local Matter client or CHIP SDK. The server's `read_attribute` API confirms the device state after a command. The JSON request format matches Python Matter Server 8.1.1 (schema 11).
+
+Commands are sent once and are not automatically replayed after a transport failure. Retained MQTT commands are ignored. Reported states are republished after a command attempt, including failures, so a UI's optimistic state is corrected. The regression tests use a local fake server and never operate real relays.
 
 Snapshots use `get_nodes` every 30 seconds. The WebSocket client matches response IDs and reconnects after a dropped connection. MQTT reconnection republishes retained discovery, availability and state, even when the values have not changed.
 
@@ -145,7 +147,7 @@ Notes:
 - **Can't connect to MQTT**: Verify MQTT broker is running and accessible
 - **Can't connect to Matter Server**: Verify Matter Server is running and WebSocket URL is correct
 - **No devices showing up**: Ensure devices are commissioned in the Matter network
-- **Commands not working**: Check `matter_ws.commands_enabled`, optional command dependencies and Matter Server logs for OnOff cluster support
+- **Commands not working**: Check `matter_ws.commands_enabled`, the command topic, the Matter Node's availability and Matter Server logs for OnOff cluster support
 
 ## Tests
 

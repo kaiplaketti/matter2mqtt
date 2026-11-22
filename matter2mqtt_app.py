@@ -178,14 +178,14 @@ class Matter2MQTT:
                     break
                 logger.error("Snapshot refresh failed; retrying on next interval: %s", e)
 
-    async def refresh_snapshot(self):
+    async def refresh_snapshot(self, *, force_publish: bool = False):
         """Refresh snapshot and publish state."""
         nodes = await self.matter_ws.snapshot_nodes()
         if not self.mqtt.connected.is_set():
             logger.warning("MQTT disconnected; snapshot will be published after reconnection")
             return
         generation = self.mqtt.connection_generation
-        force_publish = generation != self.last_mqtt_generation
+        force_publish = force_publish or generation != self.last_mqtt_generation
         # Extract onoff endpoints for all nodes
         endpoints: List[EndpointInfo] = []
         for n in nodes:
@@ -233,19 +233,22 @@ class Matter2MQTT:
             cmd = await self.cmd_queue.get()
             logger.info(f"Processing MQTT command: node {cmd.node_id} endpoint {cmd.endpoint} action {cmd.action}")
 
-            # Send to Matter
             try:
-                if self.matter_cmd.client is None:
-                    raise RuntimeError("Matter commander not connected. Commands unavailable.")
+                try:
+                    if self.matter_cmd is None:
+                        raise RuntimeError("Matter commander is disabled")
+                    await self.matter_cmd.set_onoff(cmd.node_id, cmd.endpoint, cmd.action, timeout=15.0)
+                    logger.info("Command accepted for node %s endpoint %s", cmd.node_id, cmd.endpoint)
+                    # A device read refreshes the server cache before publication.
+                    await self.matter_cmd.read_onoff(cmd.node_id, cmd.endpoint)
+                except Exception as e:
+                    logger.error("Command or state confirmation failed for node %s endpoint %s: %s", cmd.node_id, cmd.endpoint, e)
 
-                await self.matter_cmd.set_onoff(cmd.node_id, cmd.endpoint, cmd.action, timeout=15.0)
-                logger.info(f"Command sent successfully to node {cmd.node_id} endpoint {cmd.endpoint}")
-                # Refresh snapshot to confirm real state
-                await asyncio.sleep(1)
-                await self.refresh_snapshot()
-
-            except Exception as e:
-                logger.error(
-                    f"Failed to send command to node {cmd.node_id} endpoint {cmd.endpoint}: {e}",
-                    exc_info=True,
-                )
+                try:
+                    # Restore the reported state even when a UI command failed
+                    # and the cached state itself has not changed.
+                    await self.refresh_snapshot(force_publish=True)
+                except Exception as e:
+                    logger.error("Post-command snapshot failed: %s", e)
+            finally:
+                self.cmd_queue.task_done()
