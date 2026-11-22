@@ -154,6 +154,8 @@ reported by the device. The bridge converts standard mV/mA/mW to V/A/W and mWh
 to kWh, and uses the device's cumulative energy counter rather than estimating
 consumption from power. MQTT reconnection republishes discovery and valid
 measurements even when the values did not change.
+Valid measurement states are also refreshed on every snapshot (30 seconds), so
+an idle plug's unchanged zero-watt reading does not time out in Domoticz.
 
 Some plugs require a manufacturer firmware update before they expose these
 clusters. This bridge does not install device firmware, reset devices, or create

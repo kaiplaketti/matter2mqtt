@@ -326,7 +326,13 @@ class SnapshotTests(unittest.IsolatedAsyncioTestCase):
         first = self.app.mqtt.messages.copy()
         self.app.mqtt.messages.clear()
         await self.app.refresh_snapshot()
-        self.assertTrue(all(topic.endswith('/config') for topic,_ in self.app.mqtt.messages))
+        # Stable measurements still need fresh publications so Domoticz does not
+        # time out a correctly reporting zero-watt plug after an idle hour.
+        published=dict(self.app.mqtt.messages)
+        self.assertEqual(published['matter/6/1/power/state'],'500.125')
+        self.assertEqual(published['matter/6/1/voltage/state'],'230.125')
+        self.assertEqual(published['matter/6/1/current/state'],'2.345')
+        self.assertEqual(published['matter/6/1/energy_imported/state'],'12.345678')
         self.app.mqtt.messages.clear()
         self.app.mqtt.connection_generation += 1
         await self.app.refresh_snapshot()

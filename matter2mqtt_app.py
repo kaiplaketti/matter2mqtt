@@ -256,9 +256,11 @@ class Matter2MQTT:
                 if not available:
                     self.last_measurements.pop(key, None)
                     continue
-                if force_publish or self.last_measurements.get(key) != value:
-                    self.mqtt.publish_retained(measurement_state_topic(ep, metric), str(value))
-                    self.last_measurements[key] = value
+                # Refresh valid measurements every snapshot, including an idle
+                # plug's unchanged zero watts. Otherwise Domoticz's sensor timeout
+                # eventually marks a healthy, unchanged sensor as stale.
+                self.mqtt.publish_retained(measurement_state_topic(ep, metric), str(value))
+                self.last_measurements[key] = value
 
     async def command_consumer_task(self):
         """Consume commands from MQTT queue and send to Matter."""
