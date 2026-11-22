@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import json
 import os
 import pathlib
 import subprocess
@@ -16,7 +17,8 @@ from aiohttp import web
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from matter_ws import MatterWS
 from matter_commander import MatterCommander
-from models import MqttCommand
+from endpoint_mapping import EndpointMap
+from models import EndpointInfo, MqttCommand
 from mqtt_bridge import MqttBridge
 
 # App configuration is loaded at import time. Use an isolated fixture so a clean
@@ -276,6 +278,64 @@ class SnapshotTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+
+    async def test_recommissioned_endpoint_keeps_legacy_discovery_and_state_identity(self):
+        self.app.endpoint_map = EndpointMap({"6/1": "1/1"})
+        physical_nodes = NODES + [{"node_id": 6, "available": True, "attributes": {"1/6/0": True}}]
+
+        async def snapshot():
+            return physical_nodes
+
+        self.app.matter_ws.snapshot_nodes = snapshot
+        await self.app.refresh_snapshot()
+        published = dict(self.app.mqtt.messages)
+        discovery = json.loads(published["homeassistant/light/matter_1_1/config"])
+        self.assertEqual(discovery["unique_id"], "matter_1_1")
+        self.assertEqual(discovery["command_topic"], "matter/1/1/set")
+        self.assertEqual(published["matter/1/1/state"], "ON")
+        self.assertEqual(published["matter/1/1/available"], "true")
+        self.assertNotIn("homeassistant/light/matter_6_1/config", published)
+        self.assertNotIn("matter/6/1/state", published)
+        self.assertIn("matter/3/1/state", published)
+
+    async def test_legacy_ui_command_routes_to_new_physical_endpoint(self):
+        self.app.endpoint_map = EndpointMap({"6/1": "1/1"})
+        self.app.commands_enabled = True
+        self.app.matter_cmd = types.SimpleNamespace(
+            set_onoff=AsyncMock(), read_onoff=AsyncMock(return_value=False),
+        )
+        task = asyncio.create_task(self.app.command_consumer_task())
+        try:
+            await self.app.cmd_queue.put(MqttCommand(1, 1, "off"))
+            await asyncio.wait_for(self.app.cmd_queue.join(), 2)
+            self.app.matter_cmd.set_onoff.assert_awaited_once_with(6, 1, "off", timeout=15.0)
+            self.app.matter_cmd.read_onoff.assert_awaited_once_with(6, 1)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+class EndpointMappingTests(unittest.TestCase):
+    def test_no_mapping_preserves_the_existing_endpoints(self):
+        endpoint = EndpointInfo(3, 1, True, False)
+        mapping = EndpointMap()
+        self.assertEqual(mapping.mqtt_snapshot([endpoint]), [endpoint])
+        self.assertEqual(mapping.matter_target(3, 1), (3, 1))
+
+    def test_duplicate_logical_identities_are_rejected(self):
+        with self.assertRaises(ValueError):
+            EndpointMap({"6/1": "1/1", "7/1": "1/1"})
+
+    def test_alias_cannot_take_over_a_live_unmapped_device(self):
+        mapping = EndpointMap({"6/1": "1/1"})
+        with self.assertRaises(ValueError):
+            mapping.mqtt_snapshot([EndpointInfo(1, 1, True, False)])
+
+    def test_malformed_mapping_is_rejected_before_startup(self):
+        for value in [["6/1"], {"node/1": "1/1"}, {"6/1": "0/1"}]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                EndpointMap(value)
 
 
 class CommandGuardTests(unittest.IsolatedAsyncioTestCase):

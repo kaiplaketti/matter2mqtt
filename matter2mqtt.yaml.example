@@ -8,6 +8,9 @@ mqtt:
   port: 1883
   # Home Assistant MQTT discovery root; default is "homeassistant"
   discovery_prefix: homeassistant
+  # Optional physical-to-stable MQTT identities, e.g. {"42/1": "1/1"}.
+  # Keeps a home automation device identity when a plug gets a new Matter Node ID.
+  endpoint_aliases: {}
 
 matter_ws:
   # The WebSocket URL of the Matter server (python-matter-server)

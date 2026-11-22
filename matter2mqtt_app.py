@@ -12,6 +12,7 @@ from constants import (
     SNAPSHOT_REFRESH_INTERVAL,
 )
 from models import EndpointInfo, MqttCommand
+from endpoint_mapping import EndpointMap
 import mqtt_bridge as mqtt_bridge_mod
 from mqtt_bridge import MqttBridge
 from matter_ws import MatterWS
@@ -84,6 +85,7 @@ class Matter2MQTT:
         self.cmd_queue: asyncio.Queue[MqttCommand] = asyncio.Queue()
 
         self.commands_enabled = COMMANDS_ENABLED
+        self.endpoint_map = EndpointMap(config.get("mqtt", {}).get("endpoint_aliases", {}))
         self.mqtt = MqttBridge(self.loop, self.cmd_queue, commands_enabled=self.commands_enabled)
         self.matter_ws = MatterWS(MATTER_WS_URL)
         self.matter_cmd = MatterCommander(MATTER_WS_URL) if self.commands_enabled else None
@@ -190,6 +192,7 @@ class Matter2MQTT:
         endpoints: List[EndpointInfo] = []
         for n in nodes:
             endpoints.extend(extract_onoff_endpoints_from_node(n))
+        endpoints = self.endpoint_map.mqtt_snapshot(endpoints)
 
         if not endpoints:
             logger.debug("No OnOff endpoints found")
@@ -231,16 +234,17 @@ class Matter2MQTT:
             return
         while self.running:
             cmd = await self.cmd_queue.get()
-            logger.info(f"Processing MQTT command: node {cmd.node_id} endpoint {cmd.endpoint} action {cmd.action}")
+            target_node, target_endpoint = self.endpoint_map.matter_target(cmd.node_id, cmd.endpoint)
+            logger.info("Processing MQTT command: identity %s/%s -> Matter %s/%s action %s", cmd.node_id, cmd.endpoint, target_node, target_endpoint, cmd.action)
 
             try:
                 try:
                     if self.matter_cmd is None:
                         raise RuntimeError("Matter commander is disabled")
-                    await self.matter_cmd.set_onoff(cmd.node_id, cmd.endpoint, cmd.action, timeout=15.0)
-                    logger.info("Command accepted for node %s endpoint %s", cmd.node_id, cmd.endpoint)
+                    await self.matter_cmd.set_onoff(target_node, target_endpoint, cmd.action, timeout=15.0)
+                    logger.info("Command accepted for node %s endpoint %s", target_node, target_endpoint)
                     # A device read refreshes the server cache before publication.
-                    await self.matter_cmd.read_onoff(cmd.node_id, cmd.endpoint)
+                    await self.matter_cmd.read_onoff(target_node, target_endpoint)
                 except Exception as e:
                     logger.error("Command or state confirmation failed for node %s endpoint %s: %s", cmd.node_id, cmd.endpoint, e)
 

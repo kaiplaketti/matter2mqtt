@@ -151,6 +151,23 @@ Notes:
 - **No devices showing up**: Ensure devices are commissioned in the Matter network
 - **Commands not working**: Check `matter_ws.commands_enabled`, the command topic, the Matter Node's availability and Matter Server logs for OnOff cluster support
 
+## Keeping an existing device after recommissioning
+
+When a plug receives a new Matter Node ID, map its physical endpoint to the old MQTT identity in the local configuration:
+
+```yaml
+mqtt:
+  host: localhost
+  port: 1883
+  discovery_prefix: homeassistant
+  endpoint_aliases:
+    "42/1": "1/1"
+```
+
+This example publishes the physical endpoint `42/1` as `matter_1_1`, with state, availability and command topics under `matter/1/1/`. Commands to that stable identity are routed to physical endpoint `42/1`. The bridge does not publish a second discovery identity for the mapped endpoint. Other endpoints retain their identities. Duplicate identities are rejected to prevent an alias from overwriting another discovered device.
+
+This allows Domoticz MQTT Auto Discovery to reuse an existing DeviceID and IDX without editing its database or changing automations. Configure the mapping before the bridge publishes the recommissioned device. The alias is deployment-specific and belongs in the ignored local `matter2mqtt.yaml`.
+
 ## Tests
 
 After installing `requirements.txt`, run:
