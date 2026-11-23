@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from typing import Optional
 
 import paho.mqtt.client as mqtt
@@ -30,6 +31,13 @@ class MqttBridge:
         self.connected = asyncio.Event()
         self.connection_generation = 0
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        # Credentials belong in a private service EnvironmentFile, never source control.
+        username = os.getenv('MQTT_USERNAME')
+        password = os.getenv('MQTT_PASSWORD')
+        if username:
+            if not password:
+                raise ValueError('MQTT_PASSWORD is required when MQTT_USERNAME is configured')
+            self.client.username_pw_set(username, password)
         self.client.reconnect_delay_set(min_delay=1, max_delay=30)
 
         self.client.on_connect = self._on_connect
