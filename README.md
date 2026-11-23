@@ -222,3 +222,11 @@ The suite creates its own temporary configuration and uses local WebSocket/MQTT 
 ## License
 
 [Specify your license here]
+
+## Broker authentication
+
+Set `MQTT_USERNAME` and `MQTT_PASSWORD` in the bridge process environment when the broker requires authentication. For a Linux service, load them from a private systemd `EnvironmentFile` with mode `0600`; keep that file outside the repository and never commit real credentials.
+
+If a username is configured without a password, startup fails before connecting. Without a username, the existing unauthenticated development-broker behavior is preserved. Authentication does not enable relay commands: `matter_ws.commands_enabled` remains a separate setting and defaults to `false`.
+
+The regression suite includes authenticated-client configuration, rejection of an incomplete credential pair, and the original no-credentials behavior. All 40 local-fake tests pass without contacting real devices.
