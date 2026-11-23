@@ -10,7 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from aiohttp import web
 
@@ -479,6 +479,22 @@ class EndpointMappingTests(unittest.TestCase):
 
 
 class CommandGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_environment_credentials_are_used(self):
+        client = Mock()
+        with patch.dict(os.environ, {'MQTT_USERNAME': 'fixture-user', 'MQTT_PASSWORD': 'fixture-password'}), patch('mqtt_bridge.mqtt.Client', return_value=client):
+            MqttBridge(asyncio.get_running_loop(), asyncio.Queue())
+        client.username_pw_set.assert_called_once_with('fixture-user', 'fixture-password')
+
+    async def test_missing_password_fails_before_connection(self):
+        with patch.dict(os.environ, {'MQTT_USERNAME': 'fixture-user', 'MQTT_PASSWORD': ''}), self.assertRaises(ValueError):
+            MqttBridge(asyncio.get_running_loop(), asyncio.Queue())
+
+    async def test_no_credentials_preserves_public_development_broker_support(self):
+        client = Mock()
+        with patch.dict(os.environ, {'MQTT_USERNAME': '', 'MQTT_PASSWORD': ''}), patch('mqtt_bridge.mqtt.Client', return_value=client):
+            MqttBridge(asyncio.get_running_loop(), asyncio.Queue())
+        client.username_pw_set.assert_not_called()
+
     async def test_enabled_mode_subscribes_and_enqueues_nonretained_ui_commands(self):
         queue = asyncio.Queue()
         bridge = MqttBridge(asyncio.get_running_loop(), queue, commands_enabled=True)
